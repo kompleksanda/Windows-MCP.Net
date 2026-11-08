@@ -56,6 +56,12 @@ public class DesktopService : IDesktopService
     private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
 
     [DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern int GetDlgCtrlID(IntPtr hwndCtl);
+
+    [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
 
     [DllImport("user32.dll")]
@@ -1632,8 +1638,172 @@ public class DesktopService : IDesktopService
                (uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps);
     }
 
+    private static string CleanWindowString(string? input)
+    {
+        if (string.IsNullOrEmpty(input)) return string.Empty;
+        return input
+            .Replace("\u200b", "")
+            .Replace("\u200c", "")
+            .Replace("\u200d", "")
+            .Replace("\u200e", "")
+            .Replace("\u200f", "")
+            .Replace("\ufeff", "")
+            .Trim();
+    }
+
+    private string SerializeHwndElement(IntPtr hWnd, string defaultControlType = "Control")
+    {
+        GetWindowRect(hWnd, out var rect);
+        int width = rect.Right - rect.Left;
+        int height = rect.Bottom - rect.Top;
+        var windowText = CleanWindowString(GetWindowText(hWnd));
+        var className = GetClassName(hWnd);
+        var ctrlId = GetDlgCtrlID(hWnd);
+
+        var result = new
+        {
+            success = true,
+            found = true,
+            element = new
+            {
+                name = windowText,
+                automationId = ctrlId != 0 ? ctrlId.ToString() : hWnd.ToString(),
+                handle = hWnd.ToInt64(),
+                className = className,
+                controlType = defaultControlType,
+                boundingRectangle = new
+                {
+                    x = rect.Left,
+                    y = rect.Top,
+                    width = width,
+                    height = height
+                },
+                center = new
+                {
+                    x = rect.Left + width / 2,
+                    y = rect.Top + height / 2
+                },
+                isEnabled = IsWindowEnabled(hWnd),
+                isVisible = IsWindowVisible(hWnd)
+            }
+        };
+        return JsonSerializer.Serialize(result);
+    }
+
+    private static string? TrySerializeUiaElement(System.Windows.Automation.AutomationElement? el)
+    {
+        if (el == null) return null;
+        try
+        {
+            var rect = el.Current.BoundingRectangle;
+            if (rect.IsEmpty || double.IsInfinity(rect.Left) || double.IsNaN(rect.Left) || rect.Width <= 0 || rect.Height <= 0)
+            {
+                return null;
+            }
+            int x = (int)Math.Round(rect.Left);
+            int y = (int)Math.Round(rect.Top);
+            int w = (int)Math.Round(rect.Width);
+            int h = (int)Math.Round(rect.Height);
+
+            var result = new
+            {
+                success = true,
+                found = true,
+                element = new
+                {
+                    name = CleanWindowString(el.Current.Name),
+                    automationId = el.Current.AutomationId ?? string.Empty,
+                    handle = el.Current.NativeWindowHandle,
+                    className = el.Current.ClassName ?? string.Empty,
+                    controlType = el.Current.ControlType?.ProgrammaticName?.Replace("ControlType.", "") ?? "Control",
+                    boundingRectangle = new
+                    {
+                        x = x,
+                        y = y,
+                        width = w,
+                        height = h
+                    },
+                    center = new
+                    {
+                        x = x + w / 2,
+                        y = y + h / 2
+                    },
+                    isEnabled = el.Current.IsEnabled,
+                    isVisible = !el.Current.IsOffscreen
+                }
+            };
+            return JsonSerializer.Serialize(result);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static System.Windows.Automation.AutomationElement? SearchUiaSubtreeByText(
+        System.Windows.Automation.AutomationElement root,
+        string searchText,
+        int maxNodes = 400)
+    {
+        try
+        {
+            var exactCond = new System.Windows.Automation.PropertyCondition(
+                System.Windows.Automation.AutomationElement.NameProperty,
+                searchText,
+                System.Windows.Automation.PropertyConditionFlags.IgnoreCase);
+            var exact = root.FindFirst(
+                System.Windows.Automation.TreeScope.Element | System.Windows.Automation.TreeScope.Descendants,
+                exactCond);
+            if (exact != null && !exact.Current.IsOffscreen && !exact.Current.BoundingRectangle.IsEmpty)
+            {
+                return exact;
+            }
+
+            // Bounded breadth-first substring walk using ControlViewWalker
+            var walker = System.Windows.Automation.TreeWalker.ControlViewWalker;
+            var queue = new Queue<System.Windows.Automation.AutomationElement>();
+            queue.Enqueue(root);
+            int visited = 0;
+
+            while (queue.Count > 0 && visited < maxNodes)
+            {
+                var current = queue.Dequeue();
+                visited++;
+                try
+                {
+                    var name = CleanWindowString(current.Current.Name);
+                    if (!string.IsNullOrEmpty(name)
+                        && name.Contains(searchText, StringComparison.OrdinalIgnoreCase)
+                        && !current.Current.IsOffscreen
+                        && !current.Current.BoundingRectangle.IsEmpty
+                        && current != root)
+                    {
+                        return current;
+                    }
+
+                    var child = walker.GetFirstChild(current);
+                    while (child != null && visited + queue.Count < maxNodes)
+                    {
+                        queue.Enqueue(child);
+                        child = walker.GetNextSibling(child);
+                    }
+                }
+                catch
+                {
+                    // Skip stale UIA nodes
+                }
+            }
+        }
+        catch
+        {
+        }
+        return null;
+    }
+
     /// <summary>
     /// Find UI element by text content.
+    /// Searches the active foreground window (UIA controls + Win32 child controls) first,
+    /// then searches all visible top-level windows and their child controls.
     /// </summary>
     /// <param name="text">The text to search for</param>
     /// <returns>A JSON string containing element information or error message</returns>
@@ -1642,58 +1812,90 @@ public class DesktopService : IDesktopService
         try
         {
             _logger.LogInformation("Searching for UI element with text: {Text}", text);
-            
+            var cleanQuery = CleanWindowString(text);
+
+            // 1. Search inside the active foreground window first (UIA + Win32 child controls)
+            IntPtr fgWindow = GetForegroundWindow();
+            if (fgWindow != IntPtr.Zero && IsWindowVisible(fgWindow))
+            {
+                try
+                {
+                    var fgRoot = System.Windows.Automation.AutomationElement.FromHandle(fgWindow);
+                    var uiaMatch = SearchUiaSubtreeByText(fgRoot, cleanQuery, maxNodes: 450);
+                    var serialized = TrySerializeUiaElement(uiaMatch);
+                    if (serialized != null) return serialized;
+                }
+                catch
+                {
+                }
+
+                IntPtr foundChild = IntPtr.Zero;
+                EnumChildWindows(fgWindow, (childHwnd, _) =>
+                {
+                    if (!IsWindowVisible(childHwnd)) return true;
+                    var childText = CleanWindowString(GetWindowText(childHwnd));
+                    if (!string.IsNullOrEmpty(childText) && childText.Contains(cleanQuery, StringComparison.OrdinalIgnoreCase))
+                    {
+                        foundChild = childHwnd;
+                        return false;
+                    }
+                    return true;
+                }, IntPtr.Zero);
+
+                if (foundChild != IntPtr.Zero)
+                {
+                    return SerializeHwndElement(foundChild, "Control");
+                }
+            }
+
+            // 2. Search top-level windows and their Win32 child controls
             var foundWindow = IntPtr.Zero;
+            var foundControlType = "Window";
             EnumWindows((hWnd, lParam) =>
             {
-                var windowText = GetWindowText(hWnd);
-                if (!string.IsNullOrEmpty(windowText) && windowText.Contains(text, StringComparison.OrdinalIgnoreCase))
+                if (!IsWindowVisible(hWnd)) return true;
+                var windowText = CleanWindowString(GetWindowText(hWnd));
+                if (!string.IsNullOrEmpty(windowText) && windowText.Contains(cleanQuery, StringComparison.OrdinalIgnoreCase))
                 {
                     foundWindow = hWnd;
-                    return false; // Stop enumeration
+                    foundControlType = "Window";
+                    return false;
                 }
-                return true; // Continue enumeration
+
+                IntPtr childMatch = IntPtr.Zero;
+                EnumChildWindows(hWnd, (childHwnd, _) =>
+                {
+                    if (!IsWindowVisible(childHwnd)) return true;
+                    var childText = CleanWindowString(GetWindowText(childHwnd));
+                    if (!string.IsNullOrEmpty(childText) && childText.Contains(cleanQuery, StringComparison.OrdinalIgnoreCase))
+                    {
+                        childMatch = childHwnd;
+                        return false;
+                    }
+                    return true;
+                }, IntPtr.Zero);
+
+                if (childMatch != IntPtr.Zero)
+                {
+                    foundWindow = childMatch;
+                    foundControlType = "Control";
+                    return false;
+                }
+                return true;
             }, IntPtr.Zero);
-            
+
             if (foundWindow != IntPtr.Zero)
             {
-                GetWindowRect(foundWindow, out var rect);
-                var windowText = GetWindowText(foundWindow);
-                var className = GetClassName(foundWindow);
-                
-                var result = new
-                {
-                    success = true,
-                    found = true,
-                    element = new
-                    {
-                        name = windowText,
-                        automationId = foundWindow.ToString(),
-                        className = className,
-                        controlType = "Window",
-                        boundingRectangle = new
-                        {
-                            x = rect.Left,
-                            y = rect.Top,
-                            width = rect.Right - rect.Left,
-                            height = rect.Bottom - rect.Top
-                        },
-                        isEnabled = IsWindowEnabled(foundWindow),
-                        isVisible = IsWindowVisible(foundWindow)
-                    }
-                };
-                return JsonSerializer.Serialize(result);
+                return SerializeHwndElement(foundWindow, foundControlType);
             }
-            else
+
+            var notFound = new
             {
-                var result = new
-                {
-                    success = true,
-                    found = false,
-                    message = $"Element with text '{text}' not found"
-                };
-                return JsonSerializer.Serialize(result);
-            }
+                success = true,
+                found = false,
+                message = $"Element with text '{text}' not found"
+            };
+            return JsonSerializer.Serialize(notFound);
         }
         catch (Exception ex)
         {
@@ -1709,6 +1911,8 @@ public class DesktopService : IDesktopService
 
     /// <summary>
     /// Find UI element by class name.
+    /// Searches the active foreground window (UIA + Win32 child controls) first,
+    /// then searches all visible top-level windows and their child controls.
     /// </summary>
     /// <param name="className">The class name to search for</param>
     /// <returns>A JSON string containing element information or error message</returns>
@@ -1717,58 +1921,95 @@ public class DesktopService : IDesktopService
         try
         {
             _logger.LogInformation("Searching for UI element with class name: {ClassName}", className);
-            
+
+            // 1. Search active foreground window via UIA ClassNameProperty & EnumChildWindows
+            IntPtr fgWindow = GetForegroundWindow();
+            if (fgWindow != IntPtr.Zero && IsWindowVisible(fgWindow))
+            {
+                try
+                {
+                    var fgRoot = System.Windows.Automation.AutomationElement.FromHandle(fgWindow);
+                    var cond = new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.ClassNameProperty,
+                        className,
+                        System.Windows.Automation.PropertyConditionFlags.IgnoreCase);
+                    var uiaMatch = fgRoot.FindFirst(
+                        System.Windows.Automation.TreeScope.Element | System.Windows.Automation.TreeScope.Descendants,
+                        cond);
+                    var serialized = TrySerializeUiaElement(uiaMatch);
+                    if (serialized != null) return serialized;
+                }
+                catch
+                {
+                }
+
+                IntPtr foundChild = IntPtr.Zero;
+                EnumChildWindows(fgWindow, (childHwnd, _) =>
+                {
+                    if (!IsWindowVisible(childHwnd)) return true;
+                    var childCls = GetClassName(childHwnd);
+                    if (!string.IsNullOrEmpty(childCls) && (childCls.Equals(className, StringComparison.OrdinalIgnoreCase) || childCls.Contains(className, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        foundChild = childHwnd;
+                        return false;
+                    }
+                    return true;
+                }, IntPtr.Zero);
+
+                if (foundChild != IntPtr.Zero)
+                {
+                    return SerializeHwndElement(foundChild, "Control");
+                }
+            }
+
+            // 2. Search top-level windows and their child controls
             var foundWindow = IntPtr.Zero;
+            var foundControlType = "Window";
             EnumWindows((hWnd, lParam) =>
             {
+                if (!IsWindowVisible(hWnd)) return true;
                 var windowClassName = GetClassName(hWnd);
-                if (!string.IsNullOrEmpty(windowClassName) && windowClassName.Equals(className, StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrEmpty(windowClassName) && (windowClassName.Equals(className, StringComparison.OrdinalIgnoreCase) || windowClassName.Contains(className, StringComparison.OrdinalIgnoreCase)))
                 {
                     foundWindow = hWnd;
-                    return false; // Stop enumeration
+                    foundControlType = "Window";
+                    return false;
                 }
-                return true; // Continue enumeration
+
+                IntPtr childMatch = IntPtr.Zero;
+                EnumChildWindows(hWnd, (childHwnd, _) =>
+                {
+                    if (!IsWindowVisible(childHwnd)) return true;
+                    var childCls = GetClassName(childHwnd);
+                    if (!string.IsNullOrEmpty(childCls) && childCls.Equals(className, StringComparison.OrdinalIgnoreCase))
+                    {
+                        childMatch = childHwnd;
+                        return false;
+                    }
+                    return true;
+                }, IntPtr.Zero);
+
+                if (childMatch != IntPtr.Zero)
+                {
+                    foundWindow = childMatch;
+                    foundControlType = "Control";
+                    return false;
+                }
+                return true;
             }, IntPtr.Zero);
-            
+
             if (foundWindow != IntPtr.Zero)
             {
-                GetWindowRect(foundWindow, out var rect);
-                var windowText = GetWindowText(foundWindow);
-                var windowClassName = GetClassName(foundWindow);
-                
-                var result = new
-                {
-                    success = true,
-                    found = true,
-                    element = new
-                    {
-                        name = windowText,
-                        automationId = foundWindow.ToString(),
-                        className = windowClassName,
-                        controlType = "Window",
-                        boundingRectangle = new
-                        {
-                            x = rect.Left,
-                            y = rect.Top,
-                            width = rect.Right - rect.Left,
-                            height = rect.Bottom - rect.Top
-                        },
-                        isEnabled = IsWindowEnabled(foundWindow),
-                        isVisible = IsWindowVisible(foundWindow)
-                    }
-                };
-                return JsonSerializer.Serialize(result);
+                return SerializeHwndElement(foundWindow, foundControlType);
             }
-            else
+
+            var notFound = new
             {
-                var result = new
-                {
-                    success = true,
-                    found = false,
-                    message = $"Element with class name '{className}' not found"
-                };
-                return JsonSerializer.Serialize(result);
-            }
+                success = true,
+                found = false,
+                message = $"Element with class name '{className}' not found"
+            };
+            return JsonSerializer.Serialize(notFound);
         }
         catch (Exception ex)
         {
@@ -1784,6 +2025,8 @@ public class DesktopService : IDesktopService
 
     /// <summary>
     /// Find UI element by automation ID.
+    /// Searches the active foreground window via UI Automation AutomationIdProperty first,
+    /// then searches all visible top-level windows, Win32 Control IDs, and HWND fallback.
     /// </summary>
     /// <param name="automationId">The automation ID to search for</param>
     /// <returns>A JSON string containing element information or error message</returns>
@@ -1792,41 +2035,86 @@ public class DesktopService : IDesktopService
         try
         {
             _logger.LogInformation("Searching for UI element with automation ID: {AutomationId}", automationId);
-            
-            // For Windows API implementation, we'll try to parse the automationId as a window handle
-            if (IntPtr.TryParse(automationId, out var hWnd) && hWnd != IntPtr.Zero)
+
+            // 1. Search inside the active foreground window via UI Automation AutomationIdProperty
+            IntPtr fgWindow = GetForegroundWindow();
+            if (fgWindow != IntPtr.Zero && IsWindowVisible(fgWindow))
             {
-                if (IsWindowVisible(hWnd))
+                try
                 {
-                    GetWindowRect(hWnd, out var rect);
-                    var windowText = GetWindowText(hWnd);
-                    var windowClassName = GetClassName(hWnd);
-                    
-                    var result = new
+                    var fgRoot = System.Windows.Automation.AutomationElement.FromHandle(fgWindow);
+                    var cond = new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.AutomationIdProperty,
+                        automationId,
+                        System.Windows.Automation.PropertyConditionFlags.IgnoreCase);
+                    var uiaMatch = fgRoot.FindFirst(
+                        System.Windows.Automation.TreeScope.Element | System.Windows.Automation.TreeScope.Descendants,
+                        cond);
+                    var serialized = TrySerializeUiaElement(uiaMatch);
+                    if (serialized != null) return serialized;
+                }
+                catch
+                {
+                }
+
+                // Check Win32 Dialog Control IDs in active window
+                if (int.TryParse(automationId, out int targetCtrlId))
+                {
+                    IntPtr foundChild = IntPtr.Zero;
+                    EnumChildWindows(fgWindow, (childHwnd, _) =>
                     {
-                        success = true,
-                        found = true,
-                        element = new
+                        if (IsWindowVisible(childHwnd) && GetDlgCtrlID(childHwnd) == targetCtrlId)
                         {
-                            name = windowText,
-                            automationId = hWnd.ToString(),
-                            className = windowClassName,
-                            controlType = "Window",
-                            boundingRectangle = new
-                            {
-                                x = rect.Left,
-                                y = rect.Top,
-                                width = rect.Right - rect.Left,
-                                height = rect.Bottom - rect.Top
-                            },
-                            isEnabled = IsWindowEnabled(hWnd),
-                            isVisible = IsWindowVisible(hWnd)
+                            foundChild = childHwnd;
+                            return false;
                         }
-                    };
-                    return JsonSerializer.Serialize(result);
+                        return true;
+                    }, IntPtr.Zero);
+
+                    if (foundChild != IntPtr.Zero)
+                    {
+                        return SerializeHwndElement(foundChild, "Control");
+                    }
                 }
             }
-            
+
+            // 2. Search across visible top-level windows via UIA AutomationIdProperty
+            string? matchedUiaJson = null;
+            EnumWindows((hWnd, _) =>
+            {
+                if (hWnd == fgWindow || !IsWindowVisible(hWnd)) return true;
+                var title = GetWindowText(hWnd);
+                if (string.IsNullOrEmpty(title)) return true;
+                try
+                {
+                    var winRoot = System.Windows.Automation.AutomationElement.FromHandle(hWnd);
+                    var cond = new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.AutomationIdProperty,
+                        automationId,
+                        System.Windows.Automation.PropertyConditionFlags.IgnoreCase);
+                    var uiaMatch = winRoot.FindFirst(
+                        System.Windows.Automation.TreeScope.Element | System.Windows.Automation.TreeScope.Descendants,
+                        cond);
+                    matchedUiaJson = TrySerializeUiaElement(uiaMatch);
+                    if (matchedUiaJson != null) return false;
+                }
+                catch
+                {
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            if (matchedUiaJson != null)
+            {
+                return matchedUiaJson;
+            }
+
+            // 3. Fallback: parse automationId as a window handle (HWND)
+            if (IntPtr.TryParse(automationId, out var parsedHwnd) && parsedHwnd != IntPtr.Zero && IsWindowVisible(parsedHwnd))
+            {
+                return SerializeHwndElement(parsedHwnd, "Window");
+            }
+
             var notFoundResult = new
             {
                 success = true,

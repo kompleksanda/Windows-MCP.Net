@@ -69,8 +69,23 @@ public class OcrService : IOcrService, IDisposable
     private static extern int GetSystemMetrics(int nIndex);
 
     // System metrics constants
-    private const int SM_CXSCREEN = 0; // Width of the screen
-    private const int SM_CYSCREEN = 1; // Height of the screen
+    private const int SM_CXSCREEN = 0; // Width of the primary screen
+    private const int SM_CYSCREEN = 1; // Height of the primary screen
+    private const int SM_XVIRTUALSCREEN = 76; // Left of the virtual screen across all monitors
+    private const int SM_YVIRTUALSCREEN = 77; // Top of the virtual screen across all monitors
+    private const int SM_CXVIRTUALSCREEN = 78; // Width of the virtual screen across all monitors
+    private const int SM_CYVIRTUALSCREEN = 79; // Height of the virtual screen across all monitors
+
+    private static (int Left, int Top, int Width, int Height) GetVirtualScreenBounds()
+    {
+        int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (width > 0 && height > 0)
+        {
+            return (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), width, height);
+        }
+        return (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+    }
 
     /// <summary>
     /// 获取单例实例
@@ -300,11 +315,10 @@ public class OcrService : IOcrService, IDisposable
     {
         try
         {
-            _logger.LogInformation("Extracting text from entire screen");
+            _logger.LogInformation("Extracting text from entire virtual screen");
             
-            int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-            int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-            return await ExtractTextFromRegionAsync(0, 0, screenWidth, screenHeight, cancellationToken);
+            var (left, top, screenWidth, screenHeight) = GetVirtualScreenBounds();
+            return await ExtractTextFromRegionAsync(left, top, screenWidth, screenHeight, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -323,9 +337,8 @@ public class OcrService : IOcrService, IDisposable
             _logger.LogInformation("Searching for text on screen: {Text}", text);
             
             var model = await GetOrInitializeModelAsync(text);
-            int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-            int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-            using var bitmap = CaptureScreenRegion(0, 0, screenWidth, screenHeight);
+            var (left, top, screenWidth, screenHeight) = GetVirtualScreenBounds();
+            using var bitmap = CaptureScreenRegion(left, top, screenWidth, screenHeight);
             using var stream = new MemoryStream();
             bitmap.Save(stream, ImageFormat.Png);
             stream.Position = 0;
@@ -360,9 +373,8 @@ public class OcrService : IOcrService, IDisposable
             
             var model = await GetOrInitializeModelAsync(text);
             
-            int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-            int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-            using var bitmap = CaptureScreenRegion(0, 0, screenWidth, screenHeight);
+            var (left, top, screenWidth, screenHeight) = GetVirtualScreenBounds();
+            using var bitmap = CaptureScreenRegion(left, top, screenWidth, screenHeight);
             using var stream = new MemoryStream();
             bitmap.Save(stream, ImageFormat.Png);
             stream.Position = 0;
@@ -381,9 +393,9 @@ public class OcrService : IOcrService, IDisposable
                 {
                     if (region.Text.Contains(text, StringComparison.OrdinalIgnoreCase))
                     {
-                        // 返回文本区域的中心点坐标
-                        var centerX = (int)region.Rect.Center.X;
-                        var centerY = (int)region.Rect.Center.Y;
+                        // 返回文本区域的中心点坐标 (offset by virtual screen origin for multi-monitor setups)
+                        var centerX = left + (int)region.Rect.Center.X;
+                        var centerY = top + (int)region.Rect.Center.Y;
                         return (new System.Drawing.Point(centerX, centerY), 0);
                     }
                 }
