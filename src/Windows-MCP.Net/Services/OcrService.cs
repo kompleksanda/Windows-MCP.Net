@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Globalization;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using OpenCvSharp;
 using Sdcb.OpenVINO.PaddleOCR;
@@ -19,12 +22,24 @@ public class OcrService : IOcrService, IDisposable
     private readonly ILogger<OcrService> _logger;
     private static readonly Lazy<OcrService> _instance = new Lazy<OcrService>(() => new OcrService());
     private static readonly object _lock = new object();
-    private static FullOcrModel? _model = null;
+    private static readonly ConcurrentDictionary<string, FullOcrModel> _models = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed = false;
 
-    // Windows API imports for screen capture
+    // Windows API imports for screen capture and active application inspection
     [DllImport("user32.dll")]
     private static extern IntPtr GetDesktopWindow();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetKeyboardLayout(uint idThread);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetWindowDC(IntPtr hWnd);
@@ -80,59 +95,179 @@ public class OcrService : IOcrService, IDisposable
     }
 
     /// <summary>
-    /// Initialize the OCR model asynchronously.
+    /// Resolve the best OnlineFullModels profile based on:
+    /// 1. Explicit WINDOWS_MCP_OCR_LANGUAGE environment variable override
+    /// 2. Target search text script (when searching for non-ASCII characters)
+    /// 3. Active foreground application window title script & thread keyboard layout/locale
+    /// 4. Windows OS UI culture (CultureInfo.CurrentUICulture / InstalledUICulture)
     /// </summary>
-    private async Task InitializeModelAsync()
+    private (string Key, OnlineFullModels Model) ResolveModelProfile(string? hintText = null)
+    {
+        var envLang = Environment.GetEnvironmentVariable("WINDOWS_MCP_OCR_LANGUAGE");
+        if (!string.IsNullOrWhiteSpace(envLang))
         {
-            if (_model == null)
+            return MapCultureToModel(envLang.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(hintText))
+        {
+            var scriptModel = DetectScriptModel(hintText);
+            if (scriptModel != null)
             {
-                lock (_lock)
+                return scriptModel.Value;
+            }
+        }
+
+        try
+        {
+            IntPtr fgWindow = GetForegroundWindow();
+            if (fgWindow != IntPtr.Zero)
+            {
+                var sb = new StringBuilder(512);
+                if (GetWindowText(fgWindow, sb, sb.Capacity) > 0)
                 {
-                    if (_model == null)
+                    var titleModel = DetectScriptModel(sb.ToString());
+                    if (titleModel != null)
                     {
-                        try
+                        return titleModel.Value;
+                    }
+                }
+
+                uint threadId = GetWindowThreadProcessId(fgWindow, out _);
+                if (threadId != 0)
+                {
+                    IntPtr hkl = GetKeyboardLayout(threadId);
+                    int langId = (int)((ulong)hkl & 0xFFFF);
+                    if (langId > 0)
+                    {
+                        var appCulture = CultureInfo.GetCultureInfo(langId);
+                        if (!appCulture.TwoLetterISOLanguageName.Equals("iv", StringComparison.OrdinalIgnoreCase))
                         {
-                            _logger.LogInformation("Initializing OCR model...");
-                            
-                            // 诊断信息：检查OpenCV是否可用
-                            try
-                            {
-                                var version = Cv2.GetVersionString();
-                                _logger.LogInformation("OpenCV version: {Version}", version);
-                            }
-                            catch (Exception cvEx)
-                            {
-                                _logger.LogError(cvEx, "Failed to get OpenCV version - native libraries may not be loaded correctly");
-                                throw new InvalidOperationException("OpenCV native libraries are not available. This may be due to missing runtime dependencies in the dnx environment.", cvEx);
-                            }
-                            
-                            // 诊断信息：检查运行时环境
-                            var runtimeInfo = System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;
-                            var architecture = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture;
-                            _logger.LogInformation("Runtime: {Runtime}, Architecture: {Architecture}", runtimeInfo, architecture);
-                            
-                            _logger.LogInformation("Downloading OCR model...");
-                            var originalOut = Console.Out;
-                            try
-                            {
-                                Console.SetOut(Console.Error);
-                                _model = OnlineFullModels.ChineseV4.DownloadAsync().Result;
-                            }
-                            finally
-                            {
-                                Console.SetOut(originalOut);
-                            }
-                            _logger.LogInformation("OCR model downloaded and initialized successfully");
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Failed to initialize OCR model. Error: {Message}", ex.Message);
-                            throw;
+                            return MapCultureToModel(appCulture.Name);
                         }
                     }
                 }
             }
         }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not inspect foreground application locale; falling back to Windows UI culture");
+        }
+
+        var osCulture = CultureInfo.CurrentUICulture.Name;
+        if (string.IsNullOrWhiteSpace(osCulture))
+        {
+            osCulture = CultureInfo.InstalledUICulture.Name;
+        }
+        return MapCultureToModel(osCulture);
+    }
+
+    private static (string Key, OnlineFullModels Model)? DetectScriptModel(string text)
+    {
+        foreach (char c in text)
+        {
+            if ((c >= '\u3040' && c <= '\u309F') || (c >= '\u30A0' && c <= '\u30FF'))
+                return ("JapanV4", OnlineFullModels.JapanV4);
+            if ((c >= '\uAC00' && c <= '\uD7AF') || (c >= '\u1100' && c <= '\u11FF'))
+                return ("KoreanV4", OnlineFullModels.KoreanV4);
+            if (c >= '\u4E00' && c <= '\u9FFF')
+                return ("ChineseV4", OnlineFullModels.ChineseV4);
+            if (c >= '\u0400' && c <= '\u04FF')
+                return ("CyrillicV3", OnlineFullModels.CyrillicV3);
+            if (c >= '\u0600' && c <= '\u06FF')
+                return ("ArabicV4", OnlineFullModels.ArabicV4);
+            if (c >= '\u0900' && c <= '\u097F')
+                return ("DevanagariV4", OnlineFullModels.DevanagariV4);
+        }
+        return null;
+    }
+
+    private static (string Key, OnlineFullModels Model) MapCultureToModel(string cultureName)
+    {
+        var normalized = cultureName.Trim().ToLowerInvariant();
+        var lang = normalized.Split('-', '_')[0];
+
+        return lang switch
+        {
+            "en" => ("EnglishV4", OnlineFullModels.EnglishV4),
+            "zh" when normalized.Contains("tw") || normalized.Contains("hk") || normalized.Contains("mo") || normalized.Contains("hant")
+                => ("TraditionalChineseV3", OnlineFullModels.TraditionalChineseV3),
+            "zh" => ("ChineseV4", OnlineFullModels.ChineseV4),
+            "ja" => ("JapanV4", OnlineFullModels.JapanV4),
+            "ko" => ("KoreanV4", OnlineFullModels.KoreanV4),
+            "ar" or "fa" or "ur" => ("ArabicV4", OnlineFullModels.ArabicV4),
+            "hi" or "mr" or "ne" or "sa" => ("DevanagariV4", OnlineFullModels.DevanagariV4),
+            "ta" => ("TamilV4", OnlineFullModels.TamilV4),
+            "te" => ("TeluguV4", OnlineFullModels.TeluguV4),
+            "kn" => ("KannadaV4", OnlineFullModels.KannadaV4),
+            "ru" or "uk" or "bg" or "sr" or "be" or "kk" or "mn" => ("CyrillicV3", OnlineFullModels.CyrillicV3),
+            "fr" or "de" or "es" or "it" or "pt" or "nl" or "pl" or "sv" or "tr" or "vi" or "cs" or "ro" or "hu"
+                => ("LatinV3", OnlineFullModels.LatinV3),
+            _ => ("EnglishV4", OnlineFullModels.EnglishV4)
+        };
+    }
+
+    /// <summary>
+    /// Initialize and return the appropriate OCR model based on Windows environment and active application.
+    /// </summary>
+    private Task<FullOcrModel> GetOrInitializeModelAsync(string? hintText = null)
+    {
+        var (key, onlineModel) = ResolveModelProfile(hintText);
+        if (_models.TryGetValue(key, out var cachedModel))
+        {
+            return Task.FromResult(cachedModel);
+        }
+
+        lock (_lock)
+        {
+            if (_models.TryGetValue(key, out cachedModel))
+            {
+                return Task.FromResult(cachedModel);
+            }
+
+            try
+            {
+                _logger.LogInformation("Initializing OCR model '{ModelKey}'...", key);
+
+                try
+                {
+                    var version = Cv2.GetVersionString();
+                    _logger.LogInformation("OpenCV version: {Version}", version);
+                }
+                catch (Exception cvEx)
+                {
+                    _logger.LogError(cvEx, "Failed to get OpenCV version - native libraries may not be loaded correctly");
+                    throw new InvalidOperationException("OpenCV native libraries are not available. This may be due to missing runtime dependencies in the dnx environment.", cvEx);
+                }
+
+                var runtimeInfo = RuntimeInformation.RuntimeIdentifier;
+                var architecture = RuntimeInformation.ProcessArchitecture;
+                _logger.LogInformation("Runtime: {Runtime}, Architecture: {Architecture}", runtimeInfo, architecture);
+
+                _logger.LogInformation("Downloading OCR model '{ModelKey}'...", key);
+                var originalOut = Console.Out;
+                FullOcrModel downloaded;
+                try
+                {
+                    Console.SetOut(Console.Error);
+                    downloaded = onlineModel.DownloadAsync().Result;
+                }
+                finally
+                {
+                    Console.SetOut(originalOut);
+                }
+
+                _models[key] = downloaded;
+                _logger.LogInformation("OCR model '{ModelKey}' downloaded and initialized successfully", key);
+                return Task.FromResult(downloaded);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize OCR model '{ModelKey}'. Error: {Message}", key, ex.Message);
+                throw;
+            }
+        }
+    }
 
     /// <summary>
     /// Extract text from a specific region of the screen.
@@ -142,8 +277,6 @@ public class OcrService : IOcrService, IDisposable
         try
         {
             _logger.LogInformation("Extracting text from screen region: ({X}, {Y}, {Width}, {Height})", x, y, width, height);
-            
-            await InitializeModelAsync();
             
             using var bitmap = CaptureScreenRegion(x, y, width, height);
             using var stream = new MemoryStream();
@@ -189,14 +322,25 @@ public class OcrService : IOcrService, IDisposable
         {
             _logger.LogInformation("Searching for text on screen: {Text}", text);
             
-            var (extractedText, status) = await ExtractTextFromScreenAsync(cancellationToken);
-            if (status != 0)
+            var model = await GetOrInitializeModelAsync(text);
+            int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+            int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+            using var bitmap = CaptureScreenRegion(0, 0, screenWidth, screenHeight);
+            using var stream = new MemoryStream();
+            bitmap.Save(stream, ImageFormat.Png);
+            stream.Position = 0;
+
+            using (PaddleOcrAll all = new(model)
             {
-                return (false, status);
+                AllowRotateDetection = true,
+                Enable180Classification = true,
+            })
+            {
+                Mat src = Cv2.ImDecode(StreamToByte(stream), ImreadModes.Color);
+                PaddleOcrResult result = all.Run(src);
+                bool found = result.Text.Contains(text, StringComparison.OrdinalIgnoreCase);
+                return (found, 0);
             }
-            
-            bool found = extractedText.Contains(text, StringComparison.OrdinalIgnoreCase);
-            return (found, 0);
         }
         catch (Exception ex)
         {
@@ -214,7 +358,7 @@ public class OcrService : IOcrService, IDisposable
         {
             _logger.LogInformation("Getting coordinates for text: {Text}", text);
             
-            await InitializeModelAsync();
+            var model = await GetOrInitializeModelAsync(text);
             
             int screenWidth = GetSystemMetrics(SM_CXSCREEN);
             int screenHeight = GetSystemMetrics(SM_CYSCREEN);
@@ -223,7 +367,7 @@ public class OcrService : IOcrService, IDisposable
             bitmap.Save(stream, ImageFormat.Png);
             stream.Position = 0;
             
-            using (PaddleOcrAll all = new(_model)
+            using (PaddleOcrAll all = new(model)
             {
                 AllowRotateDetection = true,
                 Enable180Classification = true,
@@ -261,9 +405,9 @@ public class OcrService : IOcrService, IDisposable
     {
         try
         {
-            await InitializeModelAsync();
+            var model = await GetOrInitializeModelAsync();
 
-            using (PaddleOcrAll all = new(_model)
+            using (PaddleOcrAll all = new(model)
             {
                 AllowRotateDetection = true,
                 Enable180Classification = true,
@@ -341,7 +485,7 @@ public class OcrService : IOcrService, IDisposable
             {
                 lock (_lock)
                 {
-                    _model = null;
+                    _models.Clear();
                 }
             }
             _disposed = true;
