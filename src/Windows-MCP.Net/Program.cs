@@ -13,11 +13,12 @@ using Interface;
 /// This server provides tools for interacting with Windows desktop through the MCP protocol.
 /// </summary>
 // Configure global logger with structured logging for both console and file output
+Console.SetOut(Console.Error);
 Log.Logger = new LoggerConfiguration()
    .MinimumLevel.Debug()
    .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
    .Enrich.FromLogContext()
-   .WriteTo.Console()
+   .WriteTo.Console(standardErrorFromLevel: LogEventLevel.Verbose)
    .WriteTo.File(
        "logs/winmcplog-.txt",
        rollingInterval: RollingInterval.Day, 

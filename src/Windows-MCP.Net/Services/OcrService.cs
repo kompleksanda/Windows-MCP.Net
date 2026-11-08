@@ -112,7 +112,16 @@ public class OcrService : IOcrService, IDisposable
                             _logger.LogInformation("Runtime: {Runtime}, Architecture: {Architecture}", runtimeInfo, architecture);
                             
                             _logger.LogInformation("Downloading OCR model...");
-                            _model = OnlineFullModels.ChineseV4.DownloadAsync().Result;
+                            var originalOut = Console.Out;
+                            try
+                            {
+                                Console.SetOut(Console.Error);
+                                _model = OnlineFullModels.ChineseV4.DownloadAsync().Result;
+                            }
+                            finally
+                            {
+                                Console.SetOut(originalOut);
+                            }
                             _logger.LogInformation("OCR model downloaded and initialized successfully");
                         }
                         catch (Exception ex)
